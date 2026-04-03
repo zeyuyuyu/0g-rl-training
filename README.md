@@ -486,12 +486,6 @@ python src/evaluate.py \
 
 ---
 
-## 👥 开发团队
-
-- **RL Training Pipeline**: Zeyu
-- **Reward Function Design**: Mart
-- **0G Platform Integration**: William
-
 ## License
 
 Apache 2.0
