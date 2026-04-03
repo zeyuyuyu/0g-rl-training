@@ -85,7 +85,7 @@ python src/data_processor.py \
 
 ---
 
-### Phase 2: SFT 预热 (可选)
+### Phase 2: SFT 预热
 
 ```
 ┌────────────────────────────────────────────────────────────────────┐
@@ -104,7 +104,7 @@ python src/data_processor.py \
 
 ---
 
-### Phase 3: GRPO RL 训练 (核心)
+### Phase 3: GRPO RL 训练
 
 这是整个项目的核心。我们选择 **GRPO** 而不是传统 PPO，基于以下关键考虑：
 
