@@ -21,7 +21,7 @@
 
 ---
 
-## 🏗️ 整体架构
+## 整体架构
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -230,7 +230,7 @@ actor_rollout:
 
 ---
 
-## 🎁 Reward Function 设计 (核心创新)
+## Reward Function 设计 (核心创新)
 
 我们采用 **Execution-based Reward**，这是防止 reward hacking 的关键设计。
 
@@ -368,7 +368,7 @@ python scripts/export_for_0g.py \
 
 ---
 
-## 📈 预期效果
+## 预期效果
 
 参考 [Qwen3.5-35B-A3B-Turbo-SWE-v0.0.1](https://huggingface.co/rachpradhan/Qwen3.5-35B-A3B-Turbo-SWE-v0.0.1) 的训练结果：
 
@@ -429,7 +429,7 @@ docker save your-model | gzip > /tmp/model.tar.gz
 
 ---
 
-## 🛠️ 监控与调试
+## 监控与调试
 
 ### 训练监控
 
@@ -477,7 +477,7 @@ python src/evaluate.py \
 
 ---
 
-## 🔗 参考资源
+## 参考资源
 
 - [veRL Documentation](https://verl.readthedocs.io/)
 - [GRPO Algorithm](https://verl.readthedocs.io/en/v0.5.x/algo/grpo.html)
