@@ -1,45 +1,30 @@
-# RL Training for 0G Platform - Requirements
-# Based on veRL framework: https://verl.readthedocs.io/
+# Core
+torch>=2.1.0
+transformers>=4.40.0
+datasets>=2.19.0
+peft>=0.10.0
+accelerate>=0.30.0
 
-# Core framework
-verl>=0.5.0           # RL training framework with GRPO support
+# veRL framework
+# pip install verl  (install separately, needs specific CUDA version)
 
-# Model & Inference
-transformers>=4.40.0  # Model loading and tokenization
-accelerate>=0.30.0    # Distributed training support
-peft>=0.11.0          # LoRA and parameter-efficient fine-tuning
-vllm>=0.8.0,<0.9.0    # Fast inference for rollout generation
-
-# PyTorch ecosystem
-torch>=2.3.0          # Deep learning framework
-flash-attn>=2.5.0     # Flash attention for efficient training (optional but recommended)
+# Rollout engine (install separately based on your CUDA)
+# pip install vllm==0.8.2
 
 # Data processing
-pandas>=2.0.0         # Data manipulation
-pyarrow>=15.0.0       # Parquet format for veRL data
-datasets>=2.18.0      # HuggingFace datasets
-tqdm>=4.66.0          # Progress bars
+pyarrow>=15.0.0
+pandas>=2.0.0
+tqdm>=4.65.0
 
-# Utilities
-pyyaml>=6.0           # YAML config parsing
-numpy>=1.26.0         # Numerical operations
-matplotlib>=3.8.0     # Plotting for evaluation
+# Reward function sandbox
+# (uses stdlib: subprocess, tempfile, ast — no extra deps)
 
-# Code execution sandbox (for reward function)
-docker>=7.0.0         # Optional: Docker-based sandbox for safe code execution
+# Evaluation
+numpy>=1.24.0
+matplotlib>=3.7.0
 
-# Logging & Monitoring
-wandb>=0.16.0         # Optional: Weights & Biases logging
-tensorboard>=2.16.0   # Optional: TensorBoard logging
+# 0G export: accurate keccak256 hashing
+pycryptodome>=3.20.0
 
-# Development
-pytest>=8.0.0         # Testing
-black>=24.0.0         # Code formatting
-mypy>=1.9.0           # Type checking
-
-# Note: Install flash-attn with:
-# pip install flash-attn --no-build-isolation
-# Or skip if not using flash attention
-
-# For accurate keccak256 hashing (Ethereum-compatible)
-pycryptodome>=3.20.0  # Optional: for accurate model hash computation
+# Testing
+pytest>=7.0.0

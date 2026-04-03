@@ -1,461 +1,339 @@
 """
-Reward Functions for RL Training
+Reward Functions for veRL GRPO Training
 
-This module implements execution-based reward functions for code generation tasks,
-reference: https://huggingface.co/rachpradhan/Qwen3.5-35B-A3B-Turbo-SWE-v0.0.1
+veRL 调用 reward function 的方式有两种：
+1. 同步: compute_score(data_source, solution_str, ground_truth, extra_info) -> dict
+2. 异步: async compute_score(...) -> dict
 
-The reward function is the core of RL training - it evaluates the quality of
-generated code by actually executing it.
+本模块实现 execution-based reward function，参考:
+- Qwen3.5-35B-A3B-Turbo-SWE 的 compile+run 方案
+- veRL 文档: https://verl.readthedocs.io/en/latest/advance/reward_loop.html
 """
 
 import re
 import ast
+import json
 import tempfile
 import subprocess
 import signal
-from typing import Dict, List, Tuple, Any, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass
-import traceback
 
 
-@dataclass
-class RewardResult:
-    """Result of reward computation"""
-    total_score: float
-    breakdown: Dict[str, float]
-    details: Dict[str, Any]
-    execution_output: str = ""
-    error_message: str = ""
+# =============================================================================
+# veRL interface: compute_score
+#
+# veRL 通过 reward.custom_reward_function.path 和 .name 加载此函数。
+# 签名必须为: compute_score(data_source, solution_str, ground_truth, extra_info)
+# 返回: {"score": float, ...}
+# =============================================================================
 
-
-class CodeExecutionReward:
+def compute_score(
+    data_source: str,
+    solution_str: str,
+    ground_truth: str,
+    extra_info: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
-    Execution-based reward function for code generation.
-    
-    Similar to the one used in Qwen3.5-35B-A3B-Turbo-SWE training:
-    - Compile/parse check: 30%
-    - Test execution: 50%
-    - Code style: 20%
-    
-    Reference: https://huggingface.co/rachpradhan/Qwen3.5-35B-A3B-Turbo-SWE-v0.0.1
+    veRL reward function entry point.
+
+    根据 data_source 选择不同的 reward 逻辑:
+    - "coding" / "opencode" / "swe": execution-based reward
+    - "agent":                       trajectory-based reward
+    - 其他:                          fallback 到 format + length heuristic
+
+    Args:
+        data_source: 数据来源标识 (parquet 中的 data_source 字段)
+        solution_str: 模型生成的完整 response 字符串
+        ground_truth: reward_model.ground_truth 字段 (JSON string 或 plain text)
+        extra_info: 额外信息 (split, index, test_cases 等)
+
+    Returns:
+        {"score": float} 其中 score 在 [0, 1] 范围内
     """
-    
-    def __init__(
-        self,
-        compile_weight: float = 0.3,
-        test_weight: float = 0.5,
-        style_weight: float = 0.2,
-        timeout: int = 30,
-        test_cases: Optional[List[Tuple[Any, Any]]] = None
-    ):
-        """
-        Args:
-            compile_weight: Weight for compilation success
-            test_weight: Weight for test execution
-            style_weight: Weight for code style
-            timeout: Execution timeout in seconds
-            test_cases: List of (input, expected_output) tuples
-        """
-        self.compile_weight = compile_weight
-        self.test_weight = test_weight
-        self.style_weight = style_weight
-        self.timeout = timeout
-        self.test_cases = test_cases or []
-        
-        # Verify weights sum to 1.0
-        total = compile_weight + test_weight + style_weight
-        assert abs(total - 1.0) < 1e-6, f"Weights must sum to 1.0, got {total}"
-    
-    def extract_code(self, completion: str) -> Optional[str]:
-        """
-        Extract code from model completion.
-        Handles various formats:
-        - Code blocks with ```python or ```
-        - Raw code
-        - With/without explanation text
-        """
-        # Try to extract from code blocks
-        patterns = [
-            r'```python\n(.*?)\n```',  # ```python
-            r'```\n(.*?)\n```',         # ```
-            r'<code>(.*?)</code>',      # <code> tags
-        ]
-        
-        for pattern in patterns:
-            matches = re.findall(pattern, completion, re.DOTALL)
-            if matches:
-                return matches[-1].strip()  # Return last match
-        
-        # If no code blocks, try to parse the whole thing
-        # Heuristic: look for common Python constructs
-        if any(keyword in completion for keyword in ['def ', 'class ', 'import ', 'print(']):
-            return completion.strip()
-        
-        return None
-    
-    def check_syntax(self, code: str) -> Tuple[bool, str]:
-        """Check if code has valid Python syntax"""
-        try:
-            ast.parse(code)
-            return True, ""
-        except SyntaxError as e:
-            return False, str(e)
-        except Exception as e:
-            return False, str(e)
-    
-    def execute_code_safely(
-        self,
-        code: str,
-        test_input: Any = None
-    ) -> Tuple[bool, Any, str]:
-        """
-        Execute code in a sandboxed environment.
-        
-        Returns:
-            (success, output, error_message)
-        """
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            # Wrap code to capture output
-            wrapped_code = f"""
-import sys
-import json
+    extra_info = extra_info or {}
 
-# Redirect stdout to capture output
-from io import StringIO
-captured_output = StringIO()
-sys.stdout = captured_output
-
-# User code
-{code}
-
-# Restore stdout
-sys.stdout = sys.__stdout__
-
-# Print captured output as JSON
-print("\\n__CAPTURED_OUTPUT__")
-print(json.dumps(captured_output.getvalue()))
-"""
-            f.write(wrapped_code)
-            temp_file = f.name
-        
-        try:
-            # Run with timeout
-            result = subprocess.run(
-                ['python', temp_file],
-                capture_output=True,
-                text=True,
-                timeout=self.timeout,
-                # Security: limit resources
-                preexec_fn=self._limit_resources if hasattr(signal, 'SIGALRM') else None
-            )
-            
-            if result.returncode == 0:
-                # Extract captured output
-                output_match = re.search(
-                    r'__CAPTURED_OUTPUT__\n(.+)$',
-                    result.stdout,
-                    re.DOTALL
-                )
-                if output_match:
-                    import json
-                    try:
-                        output = json.loads(output_match.group(1))
-                    except:
-                        output = result.stdout
-                else:
-                    output = result.stdout
-                
-                return True, output, ""
-            else:
-                return False, None, result.stderr
-                
-        except subprocess.TimeoutExpired:
-            return False, None, f"Execution timeout after {self.timeout}s"
-        except Exception as e:
-            return False, None, str(e)
-        finally:
-            import os
-            try:
-                os.unlink(temp_file)
-            except:
-                pass
-    
-    def _limit_resources(self):
-        """Limit system resources for sandbox (Unix only)"""
-        import resource
-        # Limit memory to 512MB
-        resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024))
-        # Limit CPU time
-        resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
-    
-    def run_tests(self, code: str) -> Tuple[float, int, int, str]:
-        """
-        Run test cases against the code.
-        
-        Returns:
-            (pass_ratio, passed_count, total_count, error_message)
-        """
-        if not self.test_cases:
-            # No tests provided, skip
-            return 1.0, 0, 0, ""
-        
-        passed = 0
-        errors = []
-        
-        for test_input, expected_output in self.test_cases:
-            success, actual_output, error = self.execute_code_safely(
-                code,
-                test_input
-            )
-            
-            if success:
-                # Compare output (flexible matching)
-                if self._match_output(actual_output, expected_output):
-                    passed += 1
-                else:
-                    errors.append(f"Test failed: expected {expected_output}, got {actual_output}")
-            else:
-                errors.append(f"Test error: {error}")
-        
-        total = len(self.test_cases)
-        ratio = passed / total if total > 0 else 1.0
-        
-        return ratio, passed, total, "; ".join(errors) if errors else ""
-    
-    def _match_output(self, actual: Any, expected: Any) -> bool:
-        """Flexible output matching"""
-        # String match
-        if isinstance(expected, str) and isinstance(actual, str):
-            return expected.strip() == actual.strip()
-        
-        # JSON/structure match
-        try:
-            import json
-            if isinstance(actual, str):
-                actual = json.loads(actual)
-            if isinstance(expected, str):
-                expected = json.loads(expected)
-            return actual == expected
-        except:
-            pass
-        
-        # Direct comparison
-        return actual == expected
-    
-    def check_style(self, code: str) -> float:
-        """
-        Check code style quality.
-        Returns score between 0 and 1.
-        """
-        score = 1.0
-        deductions = []
-        
-        # Check for basic Python style guidelines
-        lines = code.split('\n')
-        
-        # 1. Function/class docstrings
-        if 'def ' in code and '"""' not in code and "'''" not in code:
-            deductions.append(0.1)  # Missing docstrings
-        
-        # 2. Line length
-        long_lines = sum(1 for line in lines if len(line) > 88)
-        if long_lines > 0:
-            deductions.append(min(0.1, long_lines * 0.01))
-        
-        # 3. Imports (should be at top)
-        import_pattern = re.compile(r'^import |^from ')
-        non_top_imports = 0
-        found_code = False
-        for line in lines:
-            if re.search(r'def |class ', line):
-                found_code = True
-            if found_code and import_pattern.match(line.strip()):
-                non_top_imports += 1
-        if non_top_imports > 0:
-            deductions.append(0.1)
-        
-        # 4. Check for meaningful variable names (heuristic)
-        single_char_vars = len(re.findall(r'\b[abcxyzij]\b', code))
-        if single_char_vars > 5:
-            deductions.append(0.05)
-        
-        # Apply deductions
-        score -= sum(deductions)
-        return max(0.0, score)
-    
-    def compute_reward(self, completion: str) -> RewardResult:
-        """
-        Main entry point: compute reward for a completion.
-        """
-        # Step 1: Extract code
-        code = self.extract_code(completion)
-        if code is None:
-            return RewardResult(
-                total_score=0.0,
-                breakdown={"extract": 0.0},
-                details={"error": "No code found in completion"},
-                error_message="Failed to extract code"
-            )
-        
-        # Step 2: Syntax check (30% of score)
-        syntax_ok, syntax_error = self.check_syntax(code)
-        compile_score = 1.0 if syntax_ok else 0.0
-        
-        # Step 3: Test execution (50% of score)
-        if syntax_ok:
-            test_ratio, passed, total, test_error = self.run_tests(code)
-            test_score = test_ratio
-        else:
-            test_score = 0.0
-            test_error = "Syntax error, skipping tests"
-        
-        # Step 4: Style check (20% of score)
-        style_score = self.check_style(code)
-        
-        # Calculate weighted total
-        total_score = (
-            self.compile_weight * compile_score +
-            self.test_weight * test_score +
-            self.style_weight * style_score
-        )
-        
-        return RewardResult(
-            total_score=total_score,
-            breakdown={
-                "compile": compile_score,
-                "test": test_score,
-                "style": style_score
-            },
-            details={
-                "syntax_ok": syntax_ok,
-                "syntax_error": syntax_error if not syntax_ok else "",
-                "test_passed": passed if syntax_ok else 0,
-                "test_total": total if syntax_ok else 0,
-                "test_error": test_error
-            },
-            error_message=""
-        )
-
-
-class AgentTrajectoryReward:
-    """
-    Reward function for general agent trajectories (not just code).
-    
-    Suitable for tool-use agents, multi-turn conversations, etc.
-    """
-    
-    def __init__(
-        self,
-        tool_success_weight: float = 0.5,
-        task_completion_weight: float = 0.3,
-        efficiency_weight: float = 0.2,
-        max_steps: int = 20
-    ):
-        self.tool_success_weight = tool_success_weight
-        self.task_completion_weight = task_completion_weight
-        self.efficiency_weight = efficiency_weight
-        self.max_steps = max_steps
-    
-    def compute_reward(self, trajectory: List[Dict]) -> RewardResult:
-        """
-        Compute reward for a multi-turn agent trajectory.
-        
-        Args:
-            trajectory: List of turns, each with {
-                "role": "assistant" | "tool",
-                "content": str,
-                "tool_calls": List[Dict],  # for assistant
-                "success": bool,  # for tool
-            }
-        """
-        if not trajectory:
-            return RewardResult(0.0, {}, {}, error_message="Empty trajectory")
-        
-        # 1. Tool success rate
-        tool_turns = [t for t in trajectory if t.get("role") == "tool"]
-        if tool_turns:
-            success_count = sum(1 for t in tool_turns if t.get("success", False))
-            tool_success_rate = success_count / len(tool_turns)
-        else:
-            tool_success_rate = 1.0  # No tools used, neutral
-        
-        # 2. Task completion (requires external judge)
-        # For now, use heuristics
-        last_message = trajectory[-1].get("content", "")
-        completion_indicators = [
-            "completed", "finished", "done", "success",
-            "结果", "完成", "成功"
-        ]
-        task_completion = any(ind in last_message.lower() for ind in completion_indicators)
-        task_score = 1.0 if task_completion else 0.0
-        
-        # 3. Efficiency (fewer steps is better)
-        num_steps = len(trajectory)
-        efficiency = max(0.0, 1.0 - (num_steps / self.max_steps))
-        
-        # Weighted total
-        total = (
-            self.tool_success_weight * tool_success_rate +
-            self.task_completion_weight * task_score +
-            self.efficiency_weight * efficiency
-        )
-        
-        return RewardResult(
-            total_score=total,
-            breakdown={
-                "tool_success": tool_success_rate,
-                "task_completion": task_score,
-                "efficiency": efficiency
-            },
-            details={
-                "num_steps": num_steps,
-                "num_tools": len(tool_turns)
-            }
-        )
-
-
-# Factory function for veRL integration
-def get_reward_function(config: Dict[str, Any]) -> callable:
-    """
-    Factory to create reward function based on config.
-    This is the entry point veRL will use.
-    """
-    reward_type = config.get("type", "code_execution")
-    
-    if reward_type == "code_execution":
-        reward_fn = CodeExecutionReward(
-            compile_weight=config.get("compile_weight", 0.3),
-            test_weight=config.get("test_weight", 0.5),
-            style_weight=config.get("style_weight", 0.2),
-            timeout=config.get("timeout", 30),
-            test_cases=config.get("test_cases", [])
-        )
-    elif reward_type == "agent_trajectory":
-        reward_fn = AgentTrajectoryReward(
-            tool_success_weight=config.get("tool_success_weight", 0.5),
-            task_completion_weight=config.get("task_completion_weight", 0.3),
-            efficiency_weight=config.get("efficiency_weight", 0.2)
-        )
+    if data_source in ("coding", "opencode", "swe", "code"):
+        test_cases_raw = extra_info.get("test_cases")
+        test_cases = _parse_test_cases(test_cases_raw, ground_truth)
+        result = _code_execution_reward(solution_str, test_cases)
+    elif data_source == "agent":
+        result = _agent_trajectory_reward(solution_str, ground_truth, extra_info)
     else:
-        raise ValueError(f"Unknown reward type: {reward_type}")
-    
-    # Return a callable that veRL can use
-    def reward_wrapper(completions: List[str], **kwargs) -> List[float]:
-        """Wrapper for batch processing"""
-        rewards = []
-        for completion in completions:
-            result = reward_fn.compute_reward(completion)
-            rewards.append(result.total_score)
-        return rewards
-    
-    return reward_wrapper
+        result = _generic_reward(solution_str, ground_truth)
+
+    return result
 
 
-# Default reward function for veRL config
-code_execution_reward = get_reward_function({
-    "type": "code_execution",
-    "compile_weight": 0.3,
-    "test_weight": 0.5,
-    "style_weight": 0.2,
-    "timeout": 30
-})
+# =============================================================================
+# Code Execution Reward
+#
+# R = 0.3 * compile + 0.5 * test + 0.2 * style
+# 参考 Qwen3.5-35B-A3B-Turbo-SWE: execution-based (parse + compile + run)
+# =============================================================================
+
+COMPILE_WEIGHT = 0.3
+TEST_WEIGHT = 0.5
+STYLE_WEIGHT = 0.2
+EXEC_TIMEOUT = 30  # seconds
+MEMORY_LIMIT = 512 * 1024 * 1024  # 512 MB
+
+
+def _code_execution_reward(
+    solution_str: str,
+    test_cases: List[Tuple[Any, Any]],
+) -> Dict[str, Any]:
+    """Execution-based reward: compile + run tests + style."""
+
+    code = _extract_code(solution_str)
+    if code is None:
+        return {"score": 0.0, "compile": 0.0, "test": 0.0, "style": 0.0,
+                "reason": "no_code_found"}
+
+    # 1) Syntax / compile check
+    syntax_ok, syntax_err = _check_syntax(code)
+    compile_score = 1.0 if syntax_ok else 0.0
+
+    # 2) Test execution (only if syntax OK)
+    if syntax_ok and test_cases:
+        test_score, passed, total = _run_tests(code, test_cases)
+    elif syntax_ok:
+        test_score, passed, total = 1.0, 0, 0
+    else:
+        test_score, passed, total = 0.0, 0, 0
+
+    # 3) Style
+    style_score = _check_style(code) if syntax_ok else 0.0
+
+    total_score = (
+        COMPILE_WEIGHT * compile_score
+        + TEST_WEIGHT * test_score
+        + STYLE_WEIGHT * style_score
+    )
+
+    return {
+        "score": total_score,
+        "compile": compile_score,
+        "test": test_score,
+        "style": style_score,
+        "test_passed": passed,
+        "test_total": total,
+    }
+
+
+def _extract_code(completion: str) -> Optional[str]:
+    """Extract code from model output (```python blocks, raw code, etc.)."""
+    patterns = [
+        r'```python\n(.*?)\n```',
+        r'```\n(.*?)\n```',
+        r'<code>(.*?)</code>',
+    ]
+    for pat in patterns:
+        matches = re.findall(pat, completion, re.DOTALL)
+        if matches:
+            return matches[-1].strip()
+
+    if any(kw in completion for kw in ('def ', 'class ', 'import ', 'print(')):
+        return completion.strip()
+    return None
+
+
+def _check_syntax(code: str) -> Tuple[bool, str]:
+    try:
+        ast.parse(code)
+        return True, ""
+    except SyntaxError as e:
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
+
+
+def _run_tests(
+    code: str,
+    test_cases: List[Tuple[Any, Any]],
+) -> Tuple[float, int, int]:
+    """Run test cases in sandbox. Returns (pass_ratio, passed, total)."""
+    if not test_cases:
+        return 1.0, 0, 0
+
+    passed = 0
+    for test_input, expected in test_cases:
+        ok, actual, _ = _execute_safely(code, test_input)
+        if ok and _match_output(actual, expected):
+            passed += 1
+
+    total = len(test_cases)
+    return passed / total, passed, total
+
+
+def _execute_safely(
+    code: str,
+    test_input: Any = None,
+) -> Tuple[bool, Any, str]:
+    """Execute code in a subprocess sandbox with resource limits."""
+    wrapped = (
+        "import sys, json\n"
+        "from io import StringIO\n"
+        "_captured = StringIO()\n"
+        "sys.stdout = _captured\n"
+        f"{code}\n"
+        "sys.stdout = sys.__stdout__\n"
+        'print("__OUT__")\n'
+        "print(json.dumps(_captured.getvalue()))\n"
+    )
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+        f.write(wrapped)
+        tmp = f.name
+
+    try:
+        result = subprocess.run(
+            ['python3', tmp],
+            capture_output=True, text=True,
+            timeout=EXEC_TIMEOUT,
+            preexec_fn=_limit_resources if hasattr(signal, 'SIGALRM') else None,
+        )
+        if result.returncode == 0:
+            m = re.search(r'__OUT__\n(.+)$', result.stdout, re.DOTALL)
+            if m:
+                try:
+                    return True, json.loads(m.group(1)), ""
+                except json.JSONDecodeError:
+                    return True, result.stdout, ""
+            return True, result.stdout, ""
+        return False, None, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, None, f"timeout ({EXEC_TIMEOUT}s)"
+    except Exception as e:
+        return False, None, str(e)
+    finally:
+        import os
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _limit_resources():
+    """Unix resource limits for sandbox."""
+    import resource
+    resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
+    resource.setrlimit(resource.RLIMIT_CPU, (10, 10))
+
+
+def _match_output(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, str) and isinstance(actual, str):
+        return expected.strip() == actual.strip()
+    try:
+        if isinstance(actual, str):
+            actual = json.loads(actual)
+        if isinstance(expected, str):
+            expected = json.loads(expected)
+        return actual == expected
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return str(actual).strip() == str(expected).strip()
+
+
+def _check_style(code: str) -> float:
+    """Lightweight style score [0, 1]."""
+    score = 1.0
+    lines = code.split('\n')
+
+    if 'def ' in code and '"""' not in code and "'''" not in code:
+        score -= 0.1
+
+    long_lines = sum(1 for l in lines if len(l) > 88)
+    score -= min(0.1, long_lines * 0.01)
+
+    import_re = re.compile(r'^(?:import |from )')
+    found_body = False
+    for line in lines:
+        if re.search(r'^(?:def |class )', line):
+            found_body = True
+        if found_body and import_re.match(line.strip()):
+            score -= 0.05
+            break
+
+    return max(0.0, score)
+
+
+def _parse_test_cases(raw: Any, ground_truth: str) -> List[Tuple[Any, Any]]:
+    """Parse test_cases from extra_info or ground_truth."""
+    if raw:
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except json.JSONDecodeError:
+                return []
+        if isinstance(raw, list):
+            return [(tc.get("input"), tc.get("expected")) for tc in raw
+                    if isinstance(tc, dict)]
+    if ground_truth:
+        try:
+            gt = json.loads(ground_truth)
+            if isinstance(gt, list):
+                return [(tc.get("input"), tc.get("expected")) for tc in gt
+                        if isinstance(tc, dict)]
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return []
+
+
+# =============================================================================
+# Agent Trajectory Reward
+# =============================================================================
+
+def _agent_trajectory_reward(
+    solution_str: str,
+    ground_truth: str,
+    extra_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Reward for multi-turn agent traces.
+    R = 0.5 * tool_success + 0.3 * task_completion + 0.2 * efficiency
+    """
+    try:
+        trajectory = json.loads(solution_str) if isinstance(solution_str, str) else solution_str
+    except (json.JSONDecodeError, TypeError):
+        trajectory = []
+
+    if not isinstance(trajectory, list):
+        trajectory = []
+
+    tool_turns = [t for t in trajectory if isinstance(t, dict) and t.get("role") == "tool"]
+    if tool_turns:
+        tool_ok = sum(1 for t in tool_turns if t.get("success", False))
+        tool_rate = tool_ok / len(tool_turns)
+    else:
+        tool_rate = 0.5
+
+    last_content = trajectory[-1].get("content", "") if trajectory else ""
+    done_keywords = ("completed", "finished", "done", "success", "完成", "成功")
+    task_done = 1.0 if any(kw in last_content.lower() for kw in done_keywords) else 0.0
+
+    max_steps = extra_info.get("max_steps", 20)
+    efficiency = max(0.0, 1.0 - len(trajectory) / max_steps)
+
+    total = 0.5 * tool_rate + 0.3 * task_done + 0.2 * efficiency
+    return {"score": total, "tool_success": tool_rate,
+            "task_completion": task_done, "efficiency": efficiency}
+
+
+# =============================================================================
+# Generic / Fallback Reward
+# =============================================================================
+
+def _generic_reward(solution_str: str, ground_truth: str) -> Dict[str, Any]:
+    """Fallback: exact-match + format heuristic."""
+    if ground_truth and ground_truth.strip():
+        if ground_truth.strip() in solution_str:
+            return {"score": 1.0, "method": "exact_match"}
+
+    score = 0.3
+    if len(solution_str) > 50:
+        score += 0.1
+    if '```' in solution_str:
+        score += 0.1
+    if 'def ' in solution_str or 'class ' in solution_str:
+        score += 0.1
+    return {"score": min(1.0, score), "method": "heuristic"}

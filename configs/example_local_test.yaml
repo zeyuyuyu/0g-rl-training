@@ -1,39 +1,78 @@
-# Example config for local testing (small model, small data)
-# Use this for quick validation before full training
+# =============================================================================
+# Local Test Configuration (Quick Validation)
+# =============================================================================
+#
+# 使用小模型快速验证整个 pipeline 是否能跑通。
+#
+# 等价的 CLI 命令:
+#   ./scripts/train_grpo.sh --local-test
+#
+# 或直接:
+#   python3 -m verl.trainer.main_ppo \
+#       algorithm.adv_estimator=grpo \
+#       data.train_files=./data/train.parquet \
+#       data.val_files=./data/val.parquet \
+#       data.train_batch_size=8 \
+#       data.max_prompt_length=1024 \
+#       data.max_response_length=2048 \
+#       actor_rollout_ref.model.path=Qwen/Qwen2.5-0.5B-Instruct \
+#       actor_rollout_ref.rollout.n=2 \
+#       actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
+#       actor_rollout_ref.actor.optim.lr=1e-5 \
+#       actor_rollout_ref.actor.ppo_mini_batch_size=4 \
+#       trainer.total_epochs=1 \
+#       trainer.n_gpus_per_node=1
 
-# Override main config for quick tests
+algorithm:
+  adv_estimator: grpo
+  use_kl_in_reward: false
+
 data:
-  train_files: ./data/test_train.parquet
-  val_files: ./data/test_val.parquet
-  train_batch_size: 4           # Small batch for testing
+  train_files: ./data/train.parquet
+  val_files: ./data/val.parquet
+  train_batch_size: 8
   max_prompt_length: 1024
   max_response_length: 2048
+  filter_overlong_prompts: true
+  truncation: error
 
-actor_rollout:
-  ref:
-    model:
-      path: Qwen/Qwen2.5-0.5B-Instruct  # Small model for testing
-      
-    rollout:
-      n: 2                          # Small group size for testing
-      
+actor_rollout_ref:
+  model:
+    path: Qwen/Qwen2.5-0.5B-Instruct
+    enable_gradient_checkpointing: true
+    use_remove_padding: false
+
   actor:
     optim:
       lr: 1e-5
-      
-    ppo_epochs: 1                   # Fewer epochs for testing
-    ppo_mini_batch_size: 2
+    ppo_mini_batch_size: 4
+    ppo_micro_batch_size_per_gpu: 2
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl
+
+  rollout:
+    name: vllm
+    n: 2
+    tensor_model_parallel_size: 1
+    gpu_memory_utilization: 0.3
+
+  ref:
+    fsdp_config:
+      param_offload: true
+
+reward:
+  custom_reward_function:
+    path: ./src/reward_functions.py
+    name: compute_score
 
 trainer:
-  total_epochs: 1                   # Just 1 epoch for testing
+  critic_warmup: 0
+  logger: console
+  project_name: 0g-rl-test
+  experiment_name: local-test
+  n_gpus_per_node: 1
+  nnodes: 1
+  save_freq: -1
   test_freq: 10
-  logging:
-    log_freq: 5
-    experiment_name: test-grpo-local
-  checkpoint:
-    save_freq: 50
-    output_dir: ./checkpoints/test
-
-# Disable 0G export for testing
-platform:
-  export_for_0g: false
+  total_epochs: 1

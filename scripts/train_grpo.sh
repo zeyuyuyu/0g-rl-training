@@ -1,169 +1,161 @@
 #!/bin/bash
-# GRPO Training Script for Qwen Models
-# 
-# Usage:
-#   Single GPU:     ./train_grpo.sh single
-#   Multi-GPU:      ./train_grpo.sh multi 4
-#   SLURM cluster:  ./train_grpo.sh slurm
+# GRPO Training Script — veRL Official CLI Interface
 #
-# Reference: https://verl.readthedocs.io/en/v0.5.x/algo/grpo.html
+# veRL uses `python3 -m verl.trainer.main_ppo` with dot-notation Hydra overrides.
+# This script wraps the official interface with sensible defaults for our use case.
+#
+# Usage:
+#   ./scripts/train_grpo.sh                   # Default: 4 GPUs, Qwen3.5-35B-A3B
+#   ./scripts/train_grpo.sh --gpus 8          # 8 GPUs
+#   ./scripts/train_grpo.sh --model Qwen/Qwen2.5-7B-Instruct --gpus 4
+#   ./scripts/train_grpo.sh --local-test      # Quick local test with 0.5B model
+#
+# Reference:
+#   veRL examples: https://github.com/verl-project/verl/tree/main/examples/grpo_trainer
+#   Qwen3.5-SWE:  https://huggingface.co/rachpradhan/Qwen3.5-35B-A3B-Turbo-SWE-v0.0.1
 
-set -e
+set -x
 
-# Configuration
-CONFIG_FILE=${CONFIG_FILE:-"./configs/grpo_qwen.yaml"}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-"qwen-grpo-256k"}
-OUTPUT_DIR=${OUTPUT_DIR:-"./checkpoints"}
-LOG_DIR=${LOG_DIR:-"./logs"}
+# ---------------------------------------------------------------------------
+# Defaults (override via env vars or CLI flags)
+# ---------------------------------------------------------------------------
+MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-35B-A3B}"
+TRAIN_DATA="${TRAIN_DATA:-./data/train.parquet}"
+VAL_DATA="${VAL_DATA:-./data/val.parquet}"
+N_GPUS="${N_GPUS:-4}"
+ROLLOUT_N="${ROLLOUT_N:-8}"
+TOTAL_EPOCHS="${TOTAL_EPOCHS:-5}"
+TRAIN_BATCH="${TRAIN_BATCH:-128}"
+LR="${LR:-5e-6}"
+PROJECT="${PROJECT:-0g-rl-training}"
+EXPERIMENT="${EXPERIMENT:-qwen35-grpo}"
+REWARD_FN="${REWARD_FN:-./src/reward_functions.py}"
+REWARD_FN_NAME="${REWARD_FN_NAME:-compute_score}"
+TP_SIZE="${TP_SIZE:-4}"
+ROLLOUT_ENGINE="${ROLLOUT_ENGINE:-vllm}"
+LOCAL_TEST=false
 
-# Parse command
-COMMAND=${1:-"single"}
-NUM_GPUS=${2:-4}
+# ---------------------------------------------------------------------------
+# Parse CLI flags
+# ---------------------------------------------------------------------------
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --model)        MODEL_PATH="$2";  shift 2 ;;
+        --gpus)         N_GPUS="$2";      shift 2 ;;
+        --rollout-n)    ROLLOUT_N="$2";   shift 2 ;;
+        --epochs)       TOTAL_EPOCHS="$2"; shift 2 ;;
+        --batch)        TRAIN_BATCH="$2"; shift 2 ;;
+        --lr)           LR="$2";          shift 2 ;;
+        --tp)           TP_SIZE="$2";     shift 2 ;;
+        --train-data)   TRAIN_DATA="$2";  shift 2 ;;
+        --val-data)     VAL_DATA="$2";    shift 2 ;;
+        --project)      PROJECT="$2";     shift 2 ;;
+        --experiment)   EXPERIMENT="$2";  shift 2 ;;
+        --reward-fn)    REWARD_FN="$2";   shift 2 ;;
+        --local-test)   LOCAL_TEST=true;  shift 1 ;;
+        *)              echo "Unknown flag: $1"; exit 1 ;;
+    esac
+done
 
-echo "=========================================="
-echo "GRPO Training for 0G Platform"
-echo "=========================================="
-echo "Config: $CONFIG_FILE"
-echo "Experiment: $EXPERIMENT_NAME"
-echo "Command: $COMMAND"
-echo "=========================================="
+# ---------------------------------------------------------------------------
+# Local test overrides (small model, tiny batch, 1 epoch)
+# ---------------------------------------------------------------------------
+if [ "$LOCAL_TEST" = true ]; then
+    MODEL_PATH="Qwen/Qwen2.5-0.5B-Instruct"
+    TRAIN_BATCH=8
+    ROLLOUT_N=2
+    TOTAL_EPOCHS=1
+    N_GPUS=1
+    TP_SIZE=1
+    LR="1e-5"
+    EXPERIMENT="local-test"
+    echo "=== LOCAL TEST MODE ==="
+fi
 
-# Create directories
-mkdir -p $OUTPUT_DIR/$EXPERIMENT_NAME
-mkdir -p $LOG_DIR
+echo "============================================="
+echo "  GRPO Training — 0G Compute Network"
+echo "============================================="
+echo "  Model:       $MODEL_PATH"
+echo "  GPUs:        $N_GPUS"
+echo "  Rollout N:   $ROLLOUT_N"
+echo "  Batch Size:  $TRAIN_BATCH"
+echo "  LR:          $LR"
+echo "  TP Size:     $TP_SIZE"
+echo "  Epochs:      $TOTAL_EPOCHS"
+echo "  Reward Fn:   $REWARD_FN"
+echo "============================================="
 
-# Check if veRL is installed
-if ! python -c "import verl" 2>/dev/null; then
-    echo "Error: veRL not found. Please install: pip install verl"
+# ---------------------------------------------------------------------------
+# Verify environment
+# ---------------------------------------------------------------------------
+if ! python3 -c "import verl" 2>/dev/null; then
+    echo "ERROR: veRL not installed. Run: pip install verl"
     exit 1
 fi
 
-# Training function
-train_single() {
-    echo "Running single GPU training..."
-    
-    python -m verl.trainer.main_ppo \
-        config_path=$CONFIG_FILE \
-        trainer.experiment_name=$EXPERIMENT_NAME \
-        trainer.checkpoint.output_dir=$OUTPUT_DIR/$EXPERIMENT_NAME \
-        trainer.logging.log_dir=$LOG_DIR \
-        algorithm.adv_estimator=grpo \
-        2>&1 | tee $LOG_DIR/${EXPERIMENT_NAME}_$(date +%Y%m%d_%H%M%S).log
-}
+if ! python3 -c "import vllm" 2>/dev/null && [ "$ROLLOUT_ENGINE" = "vllm" ]; then
+    echo "ERROR: vLLM not installed. Run: pip install vllm"
+    exit 1
+fi
 
-train_multi() {
-    echo "Running multi-GPU training with $NUM_GPUS GPUs..."
-    
-    # Use torchrun for multi-GPU
-    torchrun --nproc_per_node=$NUM_GPUS \
-        --nnodes=1 \
-        --node_rank=0 \
-        --master_addr=localhost \
-        --master_port=29500 \
-        -m verl.trainer.main_ppo \
-        config_path=$CONFIG_FILE \
-        trainer.experiment_name=${EXPERIMENT_NAME}_multi \
-        trainer.checkpoint.output_dir=$OUTPUT_DIR/${EXPERIMENT_NAME}_multi \
-        trainer.logging.log_dir=$LOG_DIR \
-        algorithm.adv_estimator=grpo \
-        2>&1 | tee $LOG_DIR/${EXPERIMENT_NAME}_multi_$(date +%Y%m%d_%H%M%S).log
-}
+mkdir -p ./checkpoints ./logs
 
-train_slurm() {
-    echo "Submitting SLURM job..."
-    
-    # SLURM script
-    cat > /tmp/grpo_slurm_job.sh << 'EOF'
-#!/bin/bash
-#SBATCH --job-name=grpo-training
-#SBATCH --partition=gpu
-#SBATCH --nodes=2
-#SBATCH --ntasks-per-node=8
-#SBATCH --gpus-per-node=8
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=256G
-#SBATCH --time=24:00:00
-#SBATCH --output=logs/grpo_%j.out
-#SBATCH --error=logs/grpo_%j.err
-
-# Load modules
-module load cuda/12.1
-module load python/3.10
-
-# Activate environment
-source ~/verl_env/bin/activate
-
-# Get node info
-nodes=$(scontrol show hostnames "$SLURM_JOB_NODELIST")
-nodes_array=($nodes)
-head_node=${nodes_array[0]}
-head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
-
-echo "Head node: $head_node ($head_node_ip)"
-echo "Nodes: ${nodes_array[@]}"
-
+# ---------------------------------------------------------------------------
 # Launch training
-srun torchrun \
-    --nnodes=$SLURM_NNODES \
-    --nproc_per_node=$SLURM_GPUS_PER_NODE \
-    --master_addr=$head_node_ip \
-    --master_port=29500 \
-    -m verl.trainer.main_ppo \
-    config_path=./configs/grpo_qwen.yaml \
+#
+# This directly follows veRL's official interface:
+#   python3 -m verl.trainer.main_ppo algorithm.adv_estimator=grpo ...
+#
+# All parameters use veRL's dot-notation config keys.
+# See: https://verl.readthedocs.io/en/v0.5.x/algo/grpo.html
+# ---------------------------------------------------------------------------
+python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    trainer.experiment_name=grpo_slurm_$SLURM_JOB_ID
-EOF
-
-    sbatch /tmp/grpo_slurm_job.sh
-    echo "SLURM job submitted. Check: squeue -u $USER"
-}
-
-train_0g_deploy() {
-    echo "Training with 0G deployment config..."
-    
-    # Special config for 0G platform
-    # - Freeze router for MoE
-    # - LoRA export enabled
-    # - Model hash calculation
-    
-    python -m verl.trainer.main_ppo \
-        config_path=$CONFIG_FILE \
-        trainer.experiment_name=${EXPERIMENT_NAME}_0g \
-        actor_rollout.actor.freeze_modules=[router,gate] \
-        platform.export_for_0g=true \
-        2>&1 | tee $LOG_DIR/${EXPERIMENT_NAME}_0g_$(date +%Y%m%d_%H%M%S).log
-    
-    # After training, export for 0G
-    echo "Exporting model for 0G deployment..."
-    python scripts/export_for_0g.py \
-        --checkpoint $OUTPUT_DIR/${EXPERIMENT_NAME}_0g \
-        --output ./models/0g_ready_model \
-        --compute-hash
-}
-
-# Main execution
-case $COMMAND in
-    single)
-        train_single
-        ;;
-    multi)
-        train_multi
-        ;;
-    slurm)
-        train_slurm
-        ;;
-    0g)
-        train_0g_deploy
-        ;;
-    *)
-        echo "Unknown command: $COMMAND"
-        echo "Usage: $0 {single|multi|slurm|0g} [num_gpus]"
-        exit 1
-        ;;
-esac
-
-echo "=========================================="
-echo "Training complete!"
-echo "Checkpoints: $OUTPUT_DIR/$EXPERIMENT_NAME"
-echo "Logs: $LOG_DIR"
-echo "=========================================="
+    \
+    data.train_files=$TRAIN_DATA \
+    data.val_files=$VAL_DATA \
+    data.train_batch_size=$TRAIN_BATCH \
+    data.max_prompt_length=8192 \
+    data.max_response_length=32768 \
+    data.filter_overlong_prompts=True \
+    data.truncation=error \
+    \
+    actor_rollout_ref.model.path=$MODEL_PATH \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.model.use_remove_padding=False \
+    \
+    actor_rollout_ref.actor.optim.lr=$LR \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.actor.use_kl_loss=True \
+    actor_rollout_ref.actor.kl_loss_coef=0.001 \
+    actor_rollout_ref.actor.kl_loss_type=low_var_kl \
+    actor_rollout_ref.actor.entropy_coeff=0 \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    \
+    actor_rollout_ref.rollout.name=$ROLLOUT_ENGINE \
+    actor_rollout_ref.rollout.n=$ROLLOUT_N \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=$TP_SIZE \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.4 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=2 \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    \
+    algorithm.use_kl_in_reward=False \
+    \
+    reward.custom_reward_function.path=$REWARD_FN \
+    reward.custom_reward_function.name=$REWARD_FN_NAME \
+    \
+    trainer.critic_warmup=0 \
+    trainer.logger=console \
+    trainer.project_name=$PROJECT \
+    trainer.experiment_name=$EXPERIMENT \
+    trainer.n_gpus_per_node=$N_GPUS \
+    trainer.nnodes=1 \
+    trainer.save_freq=100 \
+    trainer.test_freq=50 \
+    trainer.total_epochs=$TOTAL_EPOCHS \
+    "$@"

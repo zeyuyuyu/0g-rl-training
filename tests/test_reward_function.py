@@ -1,184 +1,135 @@
 """
-Unit tests for reward functions
+Unit tests for veRL-compatible reward functions.
+Tests the compute_score interface that veRL calls.
 """
 
+import json
 import pytest
-from src.reward_functions import (
-    CodeExecutionReward,
-    AgentTrajectoryReward,
-    RewardResult
-)
+
+from src.reward_functions import compute_score, _extract_code, _check_syntax, _check_style
 
 
-class TestCodeExecutionReward:
-    """Test code execution reward function"""
-    
-    def test_extract_code_from_markdown(self):
-        """Test code extraction from markdown blocks"""
-        reward_fn = CodeExecutionReward()
-        
-        # Test ```python block
-        completion = """Here's the solution:
+class TestComputeScoreInterface:
+    """Test the top-level compute_score function (veRL entry point)."""
 
-```python
-def hello():
-    return "world"
-```
-
-Hope this helps!"""
-        
-        code = reward_fn.extract_code(completion)
-        assert code is not None
-        assert "def hello()" in code
-    
-    def test_extract_code_from_plain(self):
-        """Test extraction from plain code"""
-        reward_fn = CodeExecutionReward()
-        
-        completion = """def hello():
-    return "world"
-"""
-        
-        code = reward_fn.extract_code(completion)
-        assert code is not None
-        assert "def hello()" in code
-    
-    def test_no_code_found(self):
-        """Test handling of completion without code"""
-        reward_fn = CodeExecutionReward()
-        
-        completion = "I don't have any code for you."
-        
-        code = reward_fn.extract_code(completion)
-        assert code is None
-    
-    def test_syntax_check_valid(self):
-        """Test syntax checking for valid code"""
-        reward_fn = CodeExecutionReward()
-        
-        code = """def hello():
-    return "world"
-"""
-        
-        is_valid, error = reward_fn.check_syntax(code)
-        assert is_valid
-        assert error == ""
-    
-    def test_syntax_check_invalid(self):
-        """Test syntax checking for invalid code"""
-        reward_fn = CodeExecutionReward()
-        
-        code = """def hello(
-    return "world"
-"""
-        
-        is_valid, error = reward_fn.check_syntax(code)
-        assert not is_valid
-        assert "SyntaxError" in error or error != ""
-    
-    def test_style_score(self):
-        """Test style scoring"""
-        reward_fn = CodeExecutionReward()
-        
-        # Good style code
-        good_code = '''
-def calculate_sum(a, b):
-    """Calculate the sum of two numbers."""
-    return a + b
-'''
-        
-        good_score = reward_fn.check_style(good_code)
-        assert good_score >= 0.7
-        
-        # Bad style code
-        bad_code = '''
-def f(x,y):
-    z=x+y
-    return z
-'''
-        
-        bad_score = reward_fn.check_style(bad_code)
-        assert bad_score < 0.7
-    
-    def test_full_reward_good_code(self):
-        """Test full reward computation for good code"""
-        reward_fn = CodeExecutionReward(
-            test_cases=[(None, "Hello World")]
+    def test_coding_good_code(self):
+        solution = '```python\ndef add(a, b):\n    """Add two numbers."""\n    return a + b\n```'
+        result = compute_score(
+            data_source="coding",
+            solution_str=solution,
+            ground_truth="",
+            extra_info={},
         )
-        
-        completion = '''```python
-print("Hello World")
-```'''
-        
-        result = reward_fn.compute_reward(completion)
-        assert isinstance(result, RewardResult)
-        assert 0 <= result.total_score <= 1
-        assert result.breakdown["compile"] > 0
-    
-    def test_full_reward_no_code(self):
-        """Test reward when no code found"""
-        reward_fn = CodeExecutionReward()
-        
-        completion = "Here's my solution: just think about it!"
-        
-        result = reward_fn.compute_reward(completion)
-        assert result.total_score == 0.0
-        assert "No code found" in result.details.get("error", "")
+        assert "score" in result
+        assert 0.0 <= result["score"] <= 1.0
+        assert result["compile"] == 1.0
 
-
-class TestAgentTrajectoryReward:
-    """Test agent trajectory reward"""
-    
-    def test_successful_trajectory(self):
-        """Test reward for successful trajectory"""
-        reward_fn = AgentTrajectoryReward()
-        
-        trajectory = [
-            {"role": "assistant", "content": "I'll help you", "tool_calls": [{"name": "search"}]},
-            {"role": "tool", "content": "Found result", "success": True},
-            {"role": "assistant", "content": "Task completed successfully!"}
-        ]
-        
-        result = reward_fn.compute_reward(trajectory)
-        assert result.total_score > 0.5
-    
-    def test_failed_trajectory(self):
-        """Test reward for failed trajectory"""
-        reward_fn = AgentTrajectoryReward()
-        
-        trajectory = [
-            {"role": "assistant", "content": "I'll help you", "tool_calls": [{"name": "search"}]},
-            {"role": "tool", "content": "Error", "success": False},
-            {"role": "assistant", "content": "Sorry, that didn't work."}
-        ]
-        
-        result = reward_fn.compute_reward(trajectory)
-        assert result.total_score < 0.5
-
-
-class TestRewardWeights:
-    """Test reward weight configurations"""
-    
-    def test_weights_sum_to_one(self):
-        """Test that weights sum to 1.0"""
-        with pytest.raises(AssertionError):
-            CodeExecutionReward(
-                compile_weight=0.5,
-                test_weight=0.5,
-                style_weight=0.5  # Sum > 1.0
-            )
-    
-    def test_custom_weights(self):
-        """Test custom weight configuration"""
-        reward_fn = CodeExecutionReward(
-            compile_weight=0.4,
-            test_weight=0.4,
-            style_weight=0.2
+    def test_coding_syntax_error(self):
+        solution = '```python\ndef add(a, b\n    return a + b\n```'
+        result = compute_score(
+            data_source="coding",
+            solution_str=solution,
+            ground_truth="",
+            extra_info={},
         )
-        
-        assert reward_fn.compile_weight == 0.4
-        assert reward_fn.test_weight == 0.4
-        assert reward_fn.style_weight == 0.2
+        assert result["compile"] == 0.0
+        assert result["score"] < 0.5
+
+    def test_coding_no_code(self):
+        result = compute_score(
+            data_source="coding",
+            solution_str="I think you should just think about it.",
+            ground_truth="",
+        )
+        assert result["score"] == 0.0
+        assert result["reason"] == "no_code_found"
+
+    def test_coding_with_test_cases(self):
+        solution = '```python\ndef add(a, b):\n    return a + b\nprint(add(1, 2))\n```'
+        test_cases = [{"input": None, "expected": "3\n"}]
+        result = compute_score(
+            data_source="coding",
+            solution_str=solution,
+            ground_truth=json.dumps(test_cases),
+            extra_info={},
+        )
+        assert result["score"] > 0.0
+        assert result["compile"] == 1.0
+
+    def test_agent_trajectory(self):
+        trajectory = json.dumps([
+            {"role": "assistant", "content": "Let me search", "tool_calls": [{"name": "grep"}]},
+            {"role": "tool", "content": "found", "success": True},
+            {"role": "assistant", "content": "Task completed successfully!"},
+        ])
+        result = compute_score(
+            data_source="agent",
+            solution_str=trajectory,
+            ground_truth="",
+            extra_info={},
+        )
+        assert "score" in result
+        assert result["score"] > 0.5
+        assert result["tool_success"] == 1.0
+        assert result["task_completion"] == 1.0
+
+    def test_generic_fallback(self):
+        result = compute_score(
+            data_source="unknown_dataset",
+            solution_str="Some random text",
+            ground_truth="",
+        )
+        assert "score" in result
+        assert result["method"] == "heuristic"
+
+    def test_generic_exact_match(self):
+        result = compute_score(
+            data_source="math",
+            solution_str="The answer is 42.",
+            ground_truth="42",
+        )
+        assert result["score"] == 1.0
+        assert result["method"] == "exact_match"
+
+
+class TestCodeExtraction:
+    def test_python_block(self):
+        text = "Here:\n```python\nprint('hi')\n```\nDone."
+        assert _extract_code(text) == "print('hi')"
+
+    def test_plain_block(self):
+        text = "Here:\n```\nimport os\nprint(os.getcwd())\n```"
+        code = _extract_code(text)
+        assert code is not None
+        assert "import os" in code
+
+    def test_raw_code(self):
+        text = "def hello():\n    return 'world'"
+        assert _extract_code(text) is not None
+
+    def test_no_code(self):
+        assert _extract_code("Just a plain sentence.") is None
+
+
+class TestSyntaxCheck:
+    def test_valid(self):
+        ok, err = _check_syntax("x = 1 + 2")
+        assert ok and err == ""
+
+    def test_invalid(self):
+        ok, err = _check_syntax("def f(\n  return 1")
+        assert not ok
+
+
+class TestStyleCheck:
+    def test_good_style(self):
+        code = 'def add(a, b):\n    """Add."""\n    return a + b'
+        assert _check_style(code) >= 0.8
+
+    def test_missing_docstring(self):
+        code = "def add(a, b):\n    return a + b"
+        score = _check_style(code)
+        assert score < 1.0
 
 
 if __name__ == "__main__":
