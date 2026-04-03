@@ -1,0 +1,39 @@
+# Example config for local testing (small model, small data)
+# Use this for quick validation before full training
+
+# Override main config for quick tests
+data:
+  train_files: ./data/test_train.parquet
+  val_files: ./data/test_val.parquet
+  train_batch_size: 4           # Small batch for testing
+  max_prompt_length: 1024
+  max_response_length: 2048
+
+actor_rollout:
+  ref:
+    model:
+      path: Qwen/Qwen2.5-0.5B-Instruct  # Small model for testing
+      
+    rollout:
+      n: 2                          # Small group size for testing
+      
+  actor:
+    optim:
+      lr: 1e-5
+      
+    ppo_epochs: 1                   # Fewer epochs for testing
+    ppo_mini_batch_size: 2
+
+trainer:
+  total_epochs: 1                   # Just 1 epoch for testing
+  test_freq: 10
+  logging:
+    log_freq: 5
+    experiment_name: test-grpo-local
+  checkpoint:
+    save_freq: 50
+    output_dir: ./checkpoints/test
+
+# Disable 0G export for testing
+platform:
+  export_for_0g: false

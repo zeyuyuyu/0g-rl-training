@@ -1,0 +1,202 @@
+# GRPO Training Configuration for Qwen Models (256K Context)
+# Based on veRL framework: https://verl.readthedocs.io/
+# Reference: https://huggingface.co/rachpradhan/Qwen3.5-35B-A3B-Turbo-SWE-v0.0.1
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+data:
+  # Training/validation data paths (parquet format required by veRL)
+  train_files: ./data/train.parquet
+  val_files: ./data/val.parquet
+  
+  # Batch sizes
+  train_batch_size: 128        # Number of prompts per global batch
+  val_batch_size: 128
+  
+  # For GRPO: total responses = train_batch_size * actor_rollout.ref.rollout.n
+  # With default n=8: 128 * 8 = 1024 responses per update
+  
+  # Data preprocessing
+  max_prompt_length: 8192     # Prompt max length
+  max_response_length: 32768  # Response max length (adjust based on GPU memory)
+  
+  # Data loading
+  shuffle: true
+  num_workers: 4
+  seed: 42
+
+# =============================================================================
+# Actor & Rollout Configuration
+# =============================================================================
+actor_rollout:
+  # Reference model (SFT checkpoint)
+  ref:
+    model:
+      path: ./checkpoints/sft-final  # Path to SFT model
+      tokenizer_path: null           # Use same as model if null
+      enable_gradient_checkpointing: true
+      use_remove_padding: true
+      
+    rollout:
+      # GRPO group sampling: number of completions per prompt
+      n: 8                           # Group size for GRPO (Qwen3.5 uses G=8)
+      
+      # Generation parameters
+      temperature: 0.6
+      top_p: 0.9
+      top_k: 50
+      use_cache: true
+      
+      # vLLM generation config
+      response_length: 32768         # Should match data.max_response_length
+      dtype: bfloat16
+      tensor_model_parallel_size: 1  # Adjust based on GPU count
+      gpu_memory_utilization: 0.85
+      
+  # Actor model (policy being trained)
+  actor:
+    model:
+      path: ./checkpoints/sft-final
+      tokenizer_path: null
+      enable_gradient_checkpointing: true
+      use_remove_padding: true
+    
+    # Optimization config
+    optim:
+      lr: 5e-6                       # Lower LR for MoE models (vs 1e-5 for dense)
+      weight_decay: 0.01
+      betas: [0.9, 0.999]
+      eps: 1e-8
+      
+    # PPO/GRPO training config
+    ppo_epochs: 2                    # Epochs per batch of rollouts
+    ppo_mini_batch_size: 32          # Mini-batch size for updates
+    
+    # Clipping
+    clip_ratio: 0.2                  # PPO clip epsilon
+    
+    # KL regularization (GRPO style: add to loss instead of reward)
+    use_kl_loss: true                # CRITICAL for GRPO
+    kl_loss_coef: 0.001              # KL penalty coefficient
+    kl_loss_type: low_var_kl         # Options: kl, abs, mse, low_var_kl, full
+    
+    # Loss aggregation mode
+    # - token-mean: (recommended, stable for long CoT)
+    # - seq-mean-token-sum: 
+    # - seq-mean-token-mean: (original GRPO paper, may be unstable)
+    loss_agg_mode: token-mean
+    
+    # MoE specific: freeze router to prevent expert collapse
+    freeze_modules:
+      - router
+      - gate
+      - shared_expert_gate
+
+# =============================================================================
+# Reward Model Configuration
+# =============================================================================
+# Note: GRPO doesn't use a value model, but veRL still needs reward_fn config
+reward_model:
+  reward_fn:
+    # Custom reward function module path
+    # Will be loaded from src/reward_functions.py
+    external_fn_module: src.reward_functions
+    external_fn_name: code_execution_reward
+    
+    # For code execution reward
+    config:
+      compile_weight: 0.3
+      test_weight: 0.5
+      style_weight: 0.2
+      timeout: 30  # seconds
+
+# =============================================================================
+# Algorithm Configuration
+# =============================================================================
+algorithm:
+  # Advantage estimator: gae (PPO) or grpo (GRPO)
+  adv_estimator: grpo              # CRITICAL: set to grpo
+  
+  # GRPO specific: normalize advantage by group std
+  norm_adv_by_std_in_grpo: true
+  
+  # Gamma for GAE (not used in GRPO but kept for compatibility)
+  gamma: 1.0
+  
+  # Lambda for GAE (not used in GRPO but kept for compatibility)
+  lam: 1.0
+
+# =============================================================================
+# Training Runtime Configuration
+# =============================================================================
+trainer:
+  # Total training steps
+  total_epochs: 3
+  
+  # Validation
+  test_freq: 50                  # Validate every N steps
+  
+  # Logging
+  logging:
+    log_freq: 10                 # Log every N steps
+    log_dir: ./logs
+    project_name: 0g-rl-training
+    experiment_name: qwen-grpo-256k
+    
+  # Checkpointing
+  checkpoint:
+    save_freq: 100               # Save every N steps
+    output_dir: ./checkpoints/grpo
+    max_to_keep: 3
+    
+  # Mixed precision
+  use_remove_padding: true
+  
+# =============================================================================
+# 256K Context Specific Settings
+# =============================================================================
+# For long context training, we recommend:
+# 1. Start with 32K context, gradually increase to 128K, then 256K
+# 2. Use activation checkpointing to save memory
+# 3. Reduce batch size if OOM
+
+long_context:
+  # Context length schedule (gradual increase)
+  # Format: [step, max_length]
+  context_schedule:
+    - [0, 32768]
+    - [500, 65536]
+    - [1000, 131072]
+    - [1500, 262144]
+    
+  # Ring attention or other long-context optimizations
+  use_ring_attention: false        # Set true if using ring attention impl
+  
+  # Memory optimization
+  enable_activation_checkpointing: true
+  sequence_parallel_size: 1      # Increase for very long contexts
+
+# =============================================================================
+# 0G Platform Integration Settings
+# =============================================================================
+platform:
+  # Export config for 0G deployment
+  export_for_0g: true
+  
+  # LoRA export settings
+  lora:
+    r: 64                          # Qwen3.5 uses rank 64
+    alpha: 128
+    target_modules:
+      - q_proj
+      - k_proj
+      - v_proj
+      - o_proj
+      - gate_proj
+      - up_proj
+      - down_proj
+    dropout: 0.05
+    
+  # Model hash calculation (will be computed after training)
+  # model_hash: "0x..."  # Auto-generated
